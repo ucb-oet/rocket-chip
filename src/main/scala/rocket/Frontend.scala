@@ -17,6 +17,8 @@ import freechips.rocketchip.util.{ClockGate, ShiftQueue, property}
 
 import freechips.rocketchip.util.UIntToAugmentedUInt
 
+import eventtrace.EventTrace
+
 class FrontendReq(implicit p: Parameters) extends CoreBundle()(p) {
   val pc = UInt(vaddrBitsExtended.W)
   val speculative = Bool()
@@ -89,6 +91,11 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   require(fetchWidth*coreInstBytes == outer.icacheParams.fetchBytes)
 
   val fq = withReset(reset.asBool || io.cpu.req.valid) { Module(new ShiftQueue(new FrontendResp, 5, flow = true)) }
+
+  /** EventTrace, in configs that trace: every live fetch packet, oldest first; see RocketTrace.Fetch. The instruction
+    * buffer and the core reach it through the tile.
+    */
+  val packets = EventTrace.collection(new RocketTrace.Fetch(vaddrBitsExtended))
 
   val clock_en_reg = Reg(Bool())
   val clock_en = clock_en_reg || io.cpu.might_request
@@ -371,6 +378,46 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   io.cpu.perf.acquire := icache.io.perf.acquire
   io.cpu.perf.tlbMiss := io.ptw.req.fire
   io.errors := icache.io.errors
+
+  // EventTrace, in configs that trace: each packet from the I-cache's answer in S2 until the instruction buffer takes
+  // it; see RocketTrace.Fetch. A packet is created as S1 moves it to S2, so a request killed in S1 is not traced. A
+  // packet S2 cannot enqueue stays one object, in Miss, while s0 asks for it again, and its retries record nothing.
+  // A packet the queue passes straight through to the buffer is never in Queue.
+  {
+    import eventtrace.EventTrace.syntax._
+    import RocketTrace.{Fetch, FetchStage, MissCause}
+
+    val schema = new EventTrace.Schema[Fetch](new Fetch(vaddrBitsExtended)) {}
+    def at(stage: FetchStage.Type) = packets.where(_.stage === stage)
+    // S1 holds the address s0 asked for again because S2 failed. It is the packet in Miss, unless S2 held no request,
+    // as when s0 left it empty for want of queue space.
+    val s1_retry = RegNext(s0_valid && !io.cpu.req.valid && s2_replay, false.B)
+    val s2_through = !fq.io.mask(0) && fq.io.deq.ready
+
+    def lookup() = schema.create(event = "lookup") { f => f.pc := s1_pc; f.stage := FetchStage.S2; packets.add(f) }
+    when (s1_valid && !s2_replay && !s2_redirect) {
+      when (s1_retry) {
+        EventTrace.test(at(FetchStage.Miss).size === 0) { lookup() }
+      } .otherwise {
+        lookup()
+      }
+    }
+    // S2 fails. A packet is in S2 only if S2 holds a request, and only on its first failure.
+    when (s2_valid && !fq.io.enq.fire && !io.cpu.req.valid) {
+      val cause = PriorityMux(Seq(
+        (fq.io.enq.valid && !fq.io.enq.ready) -> MissCause.queue_full,
+        s2_tlb_resp.miss -> MissCause.tlb,
+        true.B -> MissCause.cache))
+      EventTrace.test(at(FetchStage.S2).size === 1) {
+        val f = at(FetchStage.S2).only
+        f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause }
+      }
+    }
+    when (fq.io.enq.fire && !s2_through && !io.cpu.req.valid) {
+      val f = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only
+      f.event("enqueue") { f.stage := FetchStage.Queue }
+    }
+  }
 
   // gate the clock
   clock_en_reg := !rocketParams.clockGate.B ||

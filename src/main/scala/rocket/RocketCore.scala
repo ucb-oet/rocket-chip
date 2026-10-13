@@ -315,7 +315,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val take_pc = take_pc_mem_wb
 
   // decode stage
-  val ibuf = Module(new IBuf)
+  // EventTrace, in configs that trace: the frontend's fetch packets, which the buffer takes; see RocketTrace.Fetch.
+  val packets = tile.frontend.module.packets
+  val ibuf = Module(new IBuf(Some(packets)))
   val id_expanded_inst = ibuf.io.inst.map(_.bits.inst)
   val id_raw_inst = ibuf.io.inst.map(_.bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
@@ -1083,7 +1085,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // carrying a replay or an exception down the pipe, so a test on the stage's instructions tells them apart.
   {
     import eventtrace.EventTrace.syntax._
-    import RocketTrace.{Instruction, ReplayCause, Stage, StallCause}
+    import RocketTrace.{FetchStage, Instruction, ReplayCause, Stage, StallCause}
 
     val active = EventTrace.collection(new Instruction(vaddrBitsExtended))
     val schema = new EventTrace.Schema[Instruction](new Instruction(vaddrBitsExtended)) {}
@@ -1120,10 +1122,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     val id_hazard = id_ex_hazard || id_mem_hazard || id_wb_hazard
     val id_blocker_stage = Mux(id_ex_hazard, Stage.Execute, Mux(id_mem_hazard, Stage.Memory, Stage.Writeback))
     val id_bits = Mux(ibuf.io.inst(0).bits.rvc, id_raw_inst(0)(15, 0), id_raw_inst(0))
+    // The packet holding the head's last half. A packet in Buffer is the oldest, and a compressed instruction that
+    // starts in its held half lies wholly in it; any other instruction ends in the packet at the queue's head.
+    val id_fetch = packets.where(p => p.stage =/= FetchStage.Buffer || ibuf.io.inst(0).bits.rvc).head
     def decode(stage: Stage.Type, stalled: Boolean, blocker: Option[Instruction]) =
       schema.create(event = "decode") { i =>
         i.pc := ibuf.io.pc
         i.bits := id_bits
+        i.fetch := id_fetch
         i.stage := stage
         if (stalled) "stall" := id_stall_cause else "stall" := Absent
         blocker match {
@@ -1211,6 +1217,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }.otherwise {
         younger.iter { i => i.event("flush") { "by" := Absent; active.remove(i); i.destroy() } }
       }
+    }
+
+    // A redirect kills every fetch packet, from S2 to the instruction buffer.
+    when (take_pc) {
+      packets.iter { f => f.event("kill") { packets.remove(f); f.destroy() } }
     }
   }
 

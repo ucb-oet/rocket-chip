@@ -6,8 +6,8 @@ import chisel3._
 import eventtrace.EventTrace
 
 /** What EventTrace records of Rocket's pipeline, in configs that trace: each instruction's pass from Decode until it
-  * retires or is killed. A replay kills an instruction and everything younger and refetches them, so each pass is its
-  * own object.
+  * retires or is killed, and each fetch packet from the I-cache's answer until the instruction buffer has used it. A
+  * replay kills an instruction and everything younger and refetches them, so each pass is its own object.
   */
 object RocketTrace {
 
@@ -33,11 +33,37 @@ object RocketTrace {
   }
 
   /** One pass of a dynamic instruction through the pipeline. `bits` are as the commit log prints them, with a
-    * compressed instruction in the low half.
+    * compressed instruction in the low half. `fetch` is the packet holding its last half, whose arrival let it decode:
+    * its only packet, or the second of two.
     */
   class Instruction(pcBits: Int) extends EventTrace.ObjectType("instruction") {
     val pc    = const(UInt(pcBits.W))
     val bits  = const(UInt(32.W))
+    val fetch = const(Id(new Fetch(pcBits)))
     val stage = mutable(Stage())
+  }
+
+  /** Where a fetch packet is. S2 has the I-cache's answer; a packet S2 could not enqueue is in Miss while Rocket asks
+    * for it again; Queue is the fetch queue; Buffer is the instruction buffer holding a half the packet left over, a
+    * compressed instruction or the first half of one that ends in the next packet.
+    */
+  object FetchStage extends ChiselEnum {
+    val S2, Miss, Queue, Buffer = Value
+  }
+
+  /** Why S2 could not enqueue a packet: the fetch queue was full, the TLB missed, or else the I-cache did not answer,
+    * because it missed or was busy refilling.
+    */
+  object MissCause extends ChiselEnum {
+    val cache, tlb, queue_full = Value
+  }
+
+  /** One fetch packet, the aligned bytes one I-cache access returns, from the I-cache's answer in S2 until the
+    * instruction buffer has used it or a redirect kills it. `pc` is the address requested, which ends in 2 after a
+    * jump into the packet's second half. A request killed in S1 returned nothing and is not traced.
+    */
+  class Fetch(pcBits: Int) extends EventTrace.ObjectType("fetch") {
+    val pc    = const(UInt(pcBits.W))
+    val stage = mutable(FetchStage())
   }
 }
