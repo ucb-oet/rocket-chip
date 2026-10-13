@@ -1099,7 +1099,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Decode. The head is in Decode in the cycle it arrives, so its create event sets the stage it has after the
     // edge: Execute if it issues at once, Decode if it stalls. A head stalls from its first cycle or not at all, so
-    // the create event carries the stall's cause: the first term of ctrl_stalld that holds.
+    // the create event carries the stall's cause, the first term of ctrl_stalld that holds, and for a hazard the
+    // instruction it waits on, in the stage whose hazard holds first.
     val id_stall_cause = PriorityMux(Seq(
       id_ex_hazard -> StallCause.execute_hazard,
       id_mem_hazard -> StallCause.memory_hazard,
@@ -1116,6 +1117,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       !clock_en -> StallCause.other,
       id_do_fence -> StallCause.fence,
       true.B -> StallCause.other)) // csr_stall, id_reg_pause, traceStall
+    val id_hazard = id_ex_hazard || id_mem_hazard || id_wb_hazard
+    val id_blocker_stage = Mux(id_ex_hazard, Stage.Execute, Mux(id_mem_hazard, Stage.Memory, Stage.Writeback))
     val id_bits = Mux(ibuf.io.inst(0).bits.rvc, id_raw_inst(0)(15, 0), id_raw_inst(0))
     def decode(stage: Stage.Type, stalled: Boolean, blocker: Option[Instruction]) =
       schema.create(event = "decode") { i =>
@@ -1133,12 +1136,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       decode(Stage.Execute, stalled = false, None)
     }
     when (id_new && ctrl_stalld) {
-      when (id_stall_cause === StallCause.execute_hazard) {
-        decode(Stage.Decode, stalled = true, Some(in(Stage.Execute)))
-      } .elsewhen (id_stall_cause === StallCause.memory_hazard) {
-        decode(Stage.Decode, stalled = true, Some(in(Stage.Memory)))
-      } .elsewhen (id_stall_cause === StallCause.writeback_hazard) {
-        decode(Stage.Decode, stalled = true, Some(in(Stage.Writeback)))
+      when (id_hazard) {
+        decode(Stage.Decode, stalled = true, Some(in(id_blocker_stage)))
       } .otherwise {
         decode(Stage.Decode, stalled = true, None)
       }
