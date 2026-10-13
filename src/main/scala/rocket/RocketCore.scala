@@ -1079,23 +1079,23 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // EventTrace, in configs that trace: each instruction's pass through the pipeline, from the cycle it reaches the
   // instruction buffer's head until it retires or is killed; see RocketTrace. Each stage holds at most one
   // instruction, so a stage finds it. Fetch replay placeholders, and the carrier of an interrupt taken in Decode, are
-  // not instructions and are not traced.
+  // not instructions and are not traced. In Memory and Writeback, such a carrier has the bits of an instruction
+  // carrying a replay or an exception down the pipe, so a test on the stage's instructions tells them apart.
   {
     import eventtrace.EventTrace.syntax._
     import RocketTrace.{Instruction, ReplayCause, Stage, StallCause}
 
     val active = EventTrace.collection(new Instruction(vaddrBitsExtended))
     val schema = new EventTrace.Schema[Instruction](new Instruction(vaddrBitsExtended)) {}
-    def in(stage: Stage.Type) = active.where(_.stage === stage).only
+    def at(stage: Stage.Type) = active.where(_.stage === stage)
+    def in(stage: Stage.Type) = at(stage).only
 
-    // Whether Decode, Memory, and Writeback hold a traced instruction; Execute does exactly when ex_reg_valid. Memory
-    // and Writeback hold one also while it carries a replay or an exception down the pipe.
+    // Whether the head already has its object: it does while it stalls after its first cycle. Execute holds a traced
+    // instruction exactly when ex_reg_valid.
     val id_head = ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay
     val id_traced = RegInit(false.B)
     val id_new = id_head && !id_traced && !take_pc && !csr.io.interrupt
     id_traced := id_head && (id_traced || !csr.io.interrupt) && ctrl_stalld && !take_pc
-    val mem_traced = RegNext(ex_reg_valid && !take_pc_mem_wb, false.B)
-    val wb_traced = RegNext(mem_traced && !take_pc_wb, false.B)
 
     // Decode. The head is in Decode in the cycle it arrives, so its create event sets the stage it has after the
     // edge: Execute if it issues at once, Decode if it stalls. A head stalls from its first cycle or not at all, so
@@ -1122,10 +1122,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
         i.pc := ibuf.io.pc
         i.bits := id_bits
         i.stage := stage
-        if (stalled) "stall" := id_stall_cause else "stall" := DontCare
+        if (stalled) "stall" := id_stall_cause else "stall" := Absent
         blocker match {
           case Some(b) => "blocker" := b
-          case None    => "blocker" := DontCare
+          case None    => "blocker" := Absent
         }
         active.add(i)
       }
@@ -1163,12 +1163,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }
       i.event("memory") { i.stage := Stage.Memory }
     }
-    when (mem_traced && !take_pc_wb) {
-      val i = in(Stage.Memory)
-      when (dcache_kill_mem || fpu_kill_mem) {
-        i.event("mark_replay") { "cause" := Mux(dcache_kill_mem, ReplayCause.writeback_port, ReplayCause.fpu_nack) }
+    when (mem_pc_valid && !take_pc_wb) {
+      EventTrace.test(at(Stage.Memory).size === 1) {
+        val i = in(Stage.Memory)
+        when (dcache_kill_mem || fpu_kill_mem) {
+          i.event("mark_replay") { "cause" := Mux(dcache_kill_mem, ReplayCause.writeback_port, ReplayCause.fpu_nack) }
+        }
+        i.event("writeback") { i.stage := Stage.Writeback }
       }
-      i.event("writeback") { i.stage := Stage.Writeback }
     }
 
     // Writeback: an instruction traps, replays, or retires, in Rocket's order. The CSR file decides the trap, since
@@ -1178,17 +1180,19 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.s2_nack -> ReplayCause.cache_nack,
       replay_wb_csr -> ReplayCause.csr_stall,
       true.B -> ReplayCause.rocc_busy))
-    when (wb_traced) {
-      val i = in(Stage.Writeback)
-      when (csr.io.trace(0).exception) {
-        i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
-      } .elsewhen (replay_wb) {
-        when (wb_replay_decided) {
-          i.event("mark_replay") { "cause" := wb_replay_cause }
+    when (wb_pc_valid) {
+      EventTrace.test(at(Stage.Writeback).size === 1) {
+        val i = in(Stage.Writeback)
+        when (csr.io.trace(0).exception) {
+          i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
+        } .elsewhen (replay_wb) {
+          when (wb_replay_decided) {
+            i.event("mark_replay") { "cause" := wb_replay_cause }
+          }
+          i.event("replay") { active.remove(i); i.destroy() }
+        } .elsewhen (wb_valid) {
+          i.event("retire") { active.remove(i); i.destroy() }
         }
-        i.event("replay") { active.remove(i); i.destroy() }
-      } .elsewhen (wb_valid) {
-        i.event("retire") { active.remove(i); i.destroy() }
       }
     }
 
@@ -1196,17 +1200,17 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // flush in Writeback flushes them, naming the instruction in Writeback unless Rocket's carrier is there.
     when (take_pc_mem && !take_pc_wb) {
       val branch = in(Stage.Memory)
-      active.where(i => i.stage === Stage.Execute || i.stage === Stage.Decode).each { i =>
+      active.where(i => i.stage === Stage.Execute || i.stage === Stage.Decode).iter { i =>
         i.event("squash") { "by" := branch; active.remove(i); i.destroy() }
       }
     }
     when (take_pc_wb) {
       val younger = active.where(_.stage =/= Stage.Writeback)
-      when (wb_traced) {
+      EventTrace.test(at(Stage.Writeback).size === 1) {
         val by = in(Stage.Writeback)
-        younger.each { i => i.event("flush") { "by" := by; active.remove(i); i.destroy() } }
-      } .otherwise {
-        younger.each { i => i.event("flush") { "by" := DontCare; active.remove(i); i.destroy() } }
+        younger.iter { i => i.event("flush") { "by" := by; active.remove(i); i.destroy() } }
+      }.otherwise {
+        younger.iter { i => i.event("flush") { "by" := Absent; active.remove(i); i.destroy() } }
       }
     }
   }
