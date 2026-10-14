@@ -1182,6 +1182,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // an ecall or ebreak that Rocket's pipeline counts as valid raises an exception there.
     val wb_replay_decided = wb_reg_valid && (io.dmem.s2_nack || replay_wb_csr || replay_wb_rocc)
     val wb_replay_cause = PriorityMux(Seq(
+      (io.dmem.s2_nack && io.dmem.perf.acquire) -> ReplayCause.cache_miss,
+      (io.dmem.s2_nack && io.dmem.s2_nack_cause_raw) -> ReplayCause.store_hazard,
       io.dmem.s2_nack -> ReplayCause.cache_nack,
       replay_wb_csr -> ReplayCause.csr_stall,
       true.B -> ReplayCause.rocc_busy))

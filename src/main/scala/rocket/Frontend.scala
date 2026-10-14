@@ -407,7 +407,8 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
       val cause = PriorityMux(Seq(
         (fq.io.enq.valid && !fq.io.enq.ready) -> MissCause.queue_full,
         s2_tlb_resp.miss -> MissCause.tlb,
-        true.B -> MissCause.cache))
+        icache.io.perf.acquire -> MissCause.cache_miss,
+        true.B -> MissCause.cache_busy))
       EventTrace.test(at(FetchStage.S2).size === 1) {
         val f = at(FetchStage.S2).only
         f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause }

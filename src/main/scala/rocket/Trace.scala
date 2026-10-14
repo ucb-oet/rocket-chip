@@ -18,10 +18,13 @@ object RocketTrace {
 
   /** Why Rocket replays an instruction, by the stage that decides it: in Execute, `cache_busy`, `divider_busy`, and
     * `load_use` (an operand from a load that missed); in Memory, `writeback_port` and `fpu_nack`; in Writeback,
-    * `cache_nack`, `csr_stall`, and `rocc_busy`.
+    * `cache_miss` (the D-cache missed and asked for the line), `store_hazard` (the access touches bytes that a store
+    * the D-cache has accepted has not yet written to it), `cache_nack` (the D-cache refused it for any other reason,
+    * such as a dirty line to write back first), `csr_stall`, and `rocc_busy`.
     */
   object ReplayCause extends ChiselEnum {
-    val cache_busy, divider_busy, load_use, writeback_port, fpu_nack, cache_nack, csr_stall, rocc_busy = Value
+    val cache_busy, divider_busy, load_use, writeback_port, fpu_nack, cache_miss, store_hazard, cache_nack, csr_stall,
+      rocc_busy = Value
   }
 
   /** Why the instruction in Decode waits as its stall begins: the first term of `ctrl_stalld` that holds. A hazard
@@ -52,11 +55,12 @@ object RocketTrace {
     val S1, S2, Miss, Queue, Buffer = Value
   }
 
-  /** Why S2 could not enqueue a packet: the fetch queue was full, the TLB missed, or else the I-cache did not answer,
-    * because it missed or was busy refilling.
+  /** Why S2 could not enqueue a packet: the fetch queue was full, the TLB missed, the I-cache missed and asked for the
+    * packet's line (`cache_miss`), or else the I-cache did not answer without asking for it (`cache_busy`), as when it
+    * is already refilling another line.
     */
   object MissCause extends ChiselEnum {
-    val cache, tlb, queue_full = Value
+    val cache_miss, cache_busy, tlb, queue_full = Value
   }
 
   /** One fetch packet, the aligned bytes one I-cache access returns, from the I-cache's answer in S2 until the
