@@ -43,12 +43,13 @@ object RocketTrace {
     val stage = mutable(Stage())
   }
 
-  /** Where a fetch packet is. S2 has the I-cache's answer; a packet S2 could not enqueue is in Miss while Rocket asks
-    * for it again; Queue is the fetch queue; Buffer is the instruction buffer holding a half the packet left over, a
-    * compressed instruction or the first half of one that ends in the next packet.
+  /** Where a fetch packet is. S1 is the cycle its request is looked up in, in which it is created, so no event sets
+    * it; a view draws that cycle in it. S2 has the I-cache's answer; a packet S2 could not enqueue is in Miss while
+    * Rocket asks for it again; Queue is the fetch queue; Buffer is the instruction buffer holding a half the packet
+    * left over, a compressed instruction or the first half of one that ends in the next packet.
     */
   object FetchStage extends ChiselEnum {
-    val S2, Miss, Queue, Buffer = Value
+    val S1, S2, Miss, Queue, Buffer = Value
   }
 
   /** Why S2 could not enqueue a packet: the fetch queue was full, the TLB missed, or else the I-cache did not answer,
