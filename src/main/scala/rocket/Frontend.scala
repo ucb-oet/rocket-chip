@@ -385,7 +385,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   // A packet the queue passes straight through to the buffer is never in Queue.
   {
     import eventtrace.EventTrace.syntax._
-    import RocketTrace.{Fetch, FetchStage, MissCause}
+    import RocketTrace.{Fetch, FetchReplayCause, FetchStage, MissCause}
 
     val schema = new EventTrace.Schema[Fetch](new Fetch(vaddrBitsExtended)) {}
     def at(stage: FetchStage.Type) = packets.where(_.stage === stage)
@@ -413,6 +413,19 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
         val f = at(FetchStage.S2).only
         f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause }
       }
+    }
+    // S2 hands on a packet marked for replay, which the core will refetch from Writeback. The cause follows the terms
+    // of fq.io.enq.bits.replay; the BTB's is the one left. S2 hands on a packet after a TLB miss only for a speculative
+    // TLB refill, so the miss alone tells that term, without repeating an expression of Rocket's: firtool would merge
+    // the two and could rename Rocket's wire in configs that do not trace.
+    when (fq.io.enq.fire && fq.io.enq.bits.replay && !io.cpu.req.valid) {
+      val cause = PriorityMux(Seq(
+        (icache.io.resp.valid && icache.io.resp.bits.replay) -> FetchReplayCause.cache_error,
+        s2_tlb_resp.miss -> FetchReplayCause.speculative_tlb_miss,
+        (icache.io.s2_kill && !icache.io.resp.valid && !s2_xcpt) -> FetchReplayCause.speculative_miss,
+        true.B -> FetchReplayCause.btb_mid_instruction))
+      val f = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only
+      f.event("mark_replay") { "cause" := cause }
     }
     when (fq.io.enq.fire && !s2_through && !io.cpu.req.valid) {
       val f = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only

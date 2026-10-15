@@ -1085,7 +1085,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // carrying a replay or an exception down the pipe, so a test on the stage's instructions tells them apart.
   {
     import eventtrace.EventTrace.syntax._
-    import RocketTrace.{FetchStage, Instruction, ReplayCause, Stage, StallCause}
+    import RocketTrace.{FetchStage, Instruction, KillCause, ReplayCause, Stage, StallCause}
 
     val active = EventTrace.collection(new Instruction(vaddrBitsExtended))
     val schema = new EventTrace.Schema[Instruction](new Instruction(vaddrBitsExtended)) {}
@@ -1221,9 +1221,19 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }
     }
 
-    // A redirect kills every fetch packet, from S2 to the instruction buffer.
+    // A redirect kills every fetch packet, from S2 to the instruction buffer. Writeback's redirects come first, as
+    // io.imem.req.bits.pc chooses; Memory's are the terms of mem_wrong_npc.
+    val kill_cause = PriorityMux(Seq(
+      (csr.io.trace(0).exception && csr.io.trace(0).interrupt) -> KillCause.interrupt,
+      csr.io.trace(0).exception -> KillCause.trap,
+      csr.io.eret -> KillCause.eret,
+      replay_wb -> KillCause.replay,
+      wb_reg_flush_pipe -> KillCause.flush,
+      mem_reg_sfence -> KillCause.sfence,
+      (!ex_pc_valid && !(ibuf.io.inst(0).valid || ibuf.io.imem.valid)) -> KillCause.unconfirmed,
+      true.B -> KillCause.mispredict))
     when (take_pc) {
-      packets.iter { f => f.event("kill") { packets.remove(f); f.destroy() } }
+      packets.iter { f => f.event("kill") { "cause" := kill_cause; packets.remove(f); f.destroy() } }
     }
   }
 

@@ -63,6 +63,28 @@ object RocketTrace {
     val cache_miss, cache_busy, tlb, queue_full = Value
   }
 
+  /** Why S2 hands on a packet marked for replay, which holds no instructions: the core carries the mark to Writeback,
+    * which fetches the packet's PC again, not speculatively. `speculative_miss`: the I-cache missed on a speculative
+    * fetch it may not refill for, as Rocket's chicken bit `disableSpeculativeICacheRefill` forbids by default or an
+    * uncacheable address does; `speculative_tlb_miss`: the TLB missed on a speculative fetch without recent progress;
+    * `cache_error`: the I-cache found a parity or ECC error; `btb_mid_instruction`: the BTB predicted a taken branch in
+    * the middle of an instruction.
+    */
+  object FetchReplayCause extends ChiselEnum {
+    val speculative_miss, speculative_tlb_miss, cache_error, btb_mid_instruction = Value
+  }
+
+  /** Why the core redirected fetch, killing every packet in flight. From Writeback, in Rocket's order: `interrupt`,
+    * `trap` (an exception, including an ecall or ebreak the CSR file raises), `eret`, `replay` (an instruction Rocket
+    * replays, or a packet the frontend marked for replay), and `flush` (an instruction that flushes the pipeline, such
+    * as a CSR write or fence.i). From Memory: `sfence`; `mispredict`, where the next instruction behind is not at the
+    * PC this one goes to; and `unconfirmed`, where neither Execute nor the instruction buffer holds a next instruction
+    * to check, so Rocket redirects without knowing fetch to be wrong.
+    */
+  object KillCause extends ChiselEnum {
+    val interrupt, trap, eret, replay, flush, sfence, mispredict, unconfirmed = Value
+  }
+
   /** One fetch packet, the aligned bytes one I-cache access returns, from the I-cache's answer in S2 until the
     * instruction buffer has used it or a redirect kills it. `pc` is the address requested, which ends in 2 after a
     * jump into the packet's second half. A request killed in S1 returned nothing and is not traced.
