@@ -20,6 +20,17 @@ case class RocketCoreVectorParams(
   vExts: Seq[String]
 )
 
+/** Why the vector unit asks Rocket to replay the vector instruction in Writeback, which Rocket's trace records. The
+  * vector unit is checking an older vector instruction for traps (`checker_busy`); its backend has no free age tag,
+  * no room in its dispatch queue, or no room in its load or store instruction queue (`age_tags`, `dispatch_queue`,
+  * `memory_queue`); a vector memory instruction waits for the D-cache to write the scalar stores it holds
+  * (`store_pending`); the TLB missed (`tlb_miss`); the access continues into the next page, which the replay checks
+  * after the part in this page has issued (`page_crossing`); or another reason (`other`).
+  */
+object VectorReplayCause extends ChiselEnum {
+  val checker_busy, age_tags, dispatch_queue, memory_queue, store_pending, tlb_miss, page_crossing, other = Value
+}
+
 class VectorCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
   val status = Input(new MStatus)
   val ex = new Bundle {
@@ -42,6 +53,7 @@ class VectorCoreIO(implicit p: Parameters) extends CoreBundle()(p) {
   val wb = new Bundle {
     val store_pending = Input(Bool())
     val replay = Output(Bool())
+    val replay_cause = Output(VectorReplayCause())
     val retire = Output(Bool())
     val inst = Output(UInt(32.W))
     val rob_should_wb = Output(Bool()) // debug
@@ -85,6 +97,9 @@ class RocketVectorUnitModuleImp(outer: RocketVectorUnit) extends LazyModuleImp(o
     val fp_req = Decoupled(new FPInput())
     val fp_resp = Flipped(Decoupled(new FPResult()))
   })
+
+  // A vector unit that tells its replays apart connects this again.
+  io.core.wb.replay_cause := VectorReplayCause.other
 }
 
 abstract class RocketVectorDecoder(implicit p: Parameters) extends CoreModule()(p) {

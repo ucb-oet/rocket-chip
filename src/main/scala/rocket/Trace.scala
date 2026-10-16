@@ -11,28 +11,41 @@ import eventtrace.EventTrace
   */
 object RocketTrace {
 
-  /** The stage an instruction occupies. Decode is the instruction buffer's head, which no register holds. */
+  /** The stage an instruction occupies. Decode is the instruction buffer's head, which no register holds. Check holds
+    * a vector instruction that passed Writeback without retiring, because the vector unit took it to check for traps
+    * element by element, as Saturn's iterative fault checker does; the vector unit then has Rocket retire it or trap.
+    */
   object Stage extends ChiselEnum {
-    val Decode, Execute, Memory, Writeback = Value
+    val Decode, Execute, Memory, Writeback, Check = Value
   }
 
-  /** Why Rocket replays an instruction, by the stage that decides it: in Execute, `cache_busy`, `divider_busy`, and
-    * `load_use` (an operand from a load that missed); in Memory, `writeback_port` and `fpu_nack`; in Writeback,
-    * `cache_miss` (the D-cache missed and asked for the line), `store_hazard` (the access touches bytes that a store
-    * the D-cache has accepted has not yet written to it), `cache_nack` (the D-cache refused it for any other reason,
-    * such as a dirty line to write back first), `csr_stall`, and `rocc_busy`.
+  /** Why Rocket replays an instruction, by the stage that decides it: in Execute, `cache_busy`, `divider_busy`,
+    * `checker_busy` (the vector unit, checking an older vector instruction for traps, cannot take a vector
+    * instruction), and `load_use` (an operand from a load that missed); in Memory, `writeback_port`, `fpu_nack`,
+    * `vector_memory` (a scalar access may not pass an older vector memory instruction: the one in Writeback, or one
+    * in the vector unit whose bytes it overlaps), and `checker_busy` (the vector unit is checking an older vector
+    * instruction for traps, or takes one now); in Writeback, `cache_miss` (the D-cache missed and asked for the line),
+    * `store_hazard` (the access touches bytes that a store the D-cache has accepted has not yet written to it),
+    * `cache_nack` (the D-cache refused it for any other reason, such as a dirty line to write back first),
+    * `csr_stall`, `rocc_busy`, and the vector unit's reasons, which `VectorReplayCause` describes: `checker_busy`,
+    * `age_tags`, `dispatch_queue`, `memory_queue`, `store_pending`, `vector_tlb_miss`, `page_crossing`, and `vector`
+    * for another reason.
     */
   object ReplayCause extends ChiselEnum {
-    val cache_busy, divider_busy, load_use, writeback_port, fpu_nack, cache_miss, store_hazard, cache_nack, csr_stall,
-      rocc_busy = Value
+    val cache_busy, divider_busy, checker_busy, load_use, writeback_port, fpu_nack, vector_memory, cache_miss,
+      store_hazard, cache_nack, csr_stall, rocc_busy, age_tags, dispatch_queue, memory_queue, store_pending,
+      vector_tlb_miss, page_crossing, vector = Value
   }
 
   /** Why the instruction in Decode waits as its stall begins: the first term of `ctrl_stalld` that holds. A hazard
     * names the instruction in Execute, Memory, or Writeback whose result it needs; `scoreboard` waits on a
-    * long-latency result whose instruction has retired.
+    * long-latency result whose instruction has retired; `vconfig` is a vector instruction waiting for a vset ahead
+    * of it to set vtype and vl in Writeback, and names the youngest such vset; `vector_busy` is a vector CSR access
+    * waiting for the vector unit to finish its work.
     */
   object StallCause extends ChiselEnum {
-    val execute_hazard, memory_hazard, writeback_hazard, scoreboard, fpu, cache_busy, divider_busy, fence, other = Value
+    val execute_hazard, memory_hazard, writeback_hazard, scoreboard, vconfig, fpu, vector_busy, cache_busy,
+      divider_busy, fence, other = Value
   }
 
   /** One pass of a dynamic instruction through the pipeline. `bits` are as the commit log prints them, with a

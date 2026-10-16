@@ -1101,17 +1101,17 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     // Decode. The head is in Decode in the cycle it arrives, so its create event sets the stage it has after the
     // edge: Execute if it issues at once, Decode if it stalls. A head stalls from its first cycle or not at all, so
-    // the create event carries the stall's cause, the first term of ctrl_stalld that holds, and for a hazard the
-    // instruction it waits on, in the stage whose hazard holds first.
+    // the create event carries the stall's cause, the first term of ctrl_stalld that holds, and the instruction it
+    // waits on: for a hazard, in the stage whose hazard holds first; for vconfig, the youngest vset ahead of it.
     val id_stall_cause = PriorityMux(Seq(
       id_ex_hazard -> StallCause.execute_hazard,
       id_mem_hazard -> StallCause.memory_hazard,
       id_wb_hazard -> StallCause.writeback_hazard,
       id_sboard_hazard -> StallCause.scoreboard,
-      id_vconfig_hazard -> StallCause.other,
+      id_vconfig_hazard -> StallCause.vconfig,
       (csr.io.singleStep && (ex_reg_valid || mem_reg_valid || wb_reg_valid)) -> StallCause.other,
       (id_csr_en && csr.io.decode(0).fp_csr && !io.fpu.fcsr_rdy) -> StallCause.fpu,
-      (id_csr_en && csr.io.decode(0).vector_csr && id_vec_busy) -> StallCause.other,
+      (id_csr_en && csr.io.decode(0).vector_csr && id_vec_busy) -> StallCause.vector_busy,
       (id_ctrl.fp && id_stall_fpu) -> StallCause.fpu,
       (id_ctrl.mem && dcache_blocked) -> StallCause.cache_busy,
       (id_ctrl.rocc && rocc_blocked) -> StallCause.other,
@@ -1121,6 +1121,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       true.B -> StallCause.other)) // csr_stall, id_reg_pause, traceStall
     val id_hazard = id_ex_hazard || id_mem_hazard || id_wb_hazard
     val id_blocker_stage = Mux(id_ex_hazard, Stage.Execute, Mux(id_mem_hazard, Stage.Memory, Stage.Writeback))
+    val id_vconfig_stall = !id_hazard && !id_sboard_hazard && id_vconfig_hazard
+    val id_vconfig_stage = Mux(ex_reg_valid && ex_reg_set_vconfig, Stage.Execute,
+      Mux(mem_reg_valid && mem_reg_set_vconfig, Stage.Memory, Stage.Writeback))
     val id_bits = Mux(ibuf.io.inst(0).bits.rvc, id_raw_inst(0)(15, 0), id_raw_inst(0))
     // The packet holding the head's last half. A packet in Buffer is the oldest, and a compressed instruction that
     // starts in its held half lies wholly in it; any other instruction ends in the packet at the queue's head.
@@ -1144,6 +1147,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     when (id_new && ctrl_stalld) {
       when (id_hazard) {
         decode(Stage.Decode, stalled = true, Some(in(id_blocker_stage)))
+      } .elsewhen (id_vconfig_stall) {
+        decode(Stage.Decode, stalled = true, Some(in(id_vconfig_stage)))
       } .otherwise {
         decode(Stage.Decode, stalled = true, None)
       }
@@ -1157,54 +1162,103 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // has decided to replay, which `mark_replay` marks.
     val ex_cache_busy = ex_ctrl.mem && !io.dmem.req.ready
     val ex_divider_busy = ex_ctrl.div && !div.io.req.ready
+    val ex_checker_busy = ex_ctrl.vec && !io.vector.map(_.ex.ready).getOrElse(true.B)
     val ex_replay_cause = PriorityMux(Seq(
       ex_cache_busy -> ReplayCause.cache_busy,
       ex_divider_busy -> ReplayCause.divider_busy,
+      ex_checker_busy -> ReplayCause.checker_busy,
       true.B -> ReplayCause.load_use))
     when (ex_reg_valid && !take_pc_mem_wb) {
       val i = in(Stage.Execute)
-      when (ex_cache_busy || ex_divider_busy || replay_ex_load_use) {
+      when (ex_cache_busy || ex_divider_busy || ex_checker_busy || replay_ex_load_use) {
         i.event("mark_replay") { "cause" := ex_replay_cause }
       }
       i.event("memory") { i.stage := Stage.Memory }
     }
+    val mem_replay_cause = PriorityMux(Seq(
+      dcache_kill_mem -> ReplayCause.writeback_port,
+      fpu_kill_mem -> ReplayCause.fpu_nack,
+      vec_kill_mem -> ReplayCause.vector_memory,
+      true.B -> ReplayCause.checker_busy))
     when (mem_pc_valid && !take_pc_wb) {
       EventTrace.test(at(Stage.Memory).size === 1) {
         val i = in(Stage.Memory)
-        when (dcache_kill_mem || fpu_kill_mem) {
-          i.event("mark_replay") { "cause" := Mux(dcache_kill_mem, ReplayCause.writeback_port, ReplayCause.fpu_nack) }
+        when (dcache_kill_mem || fpu_kill_mem || vec_kill_mem || vec_kill_all) {
+          i.event("mark_replay") { "cause" := mem_replay_cause }
         }
         i.event("writeback") { i.stage := Stage.Writeback }
       }
     }
 
     // Writeback: an instruction traps, replays, or retires, in Rocket's order. The CSR file decides the trap, since
-    // an ecall or ebreak that Rocket's pipeline counts as valid raises an exception there.
-    val wb_replay_decided = wb_reg_valid && (io.dmem.s2_nack || replay_wb_csr || replay_wb_rocc)
+    // an ecall or ebreak that Rocket's pipeline counts as valid raises an exception there. A vector instruction that
+    // the vector unit lets pass without retiring goes to Check. While one is there, the vector unit has Rocket kill
+    // every instruction in Memory, so the one in Writeback replays, and a trap is the checked instruction's. That kill
+    // alone leaves an instruction valid, and Memory has already marked why it replays.
+    val wb_vector_replay_cause = io.vector.map { v =>
+      val c = v.wb.replay_cause
+      PriorityMux(Seq(
+        (c === VectorReplayCause.checker_busy) -> ReplayCause.checker_busy,
+        (c === VectorReplayCause.age_tags) -> ReplayCause.age_tags,
+        (c === VectorReplayCause.dispatch_queue) -> ReplayCause.dispatch_queue,
+        (c === VectorReplayCause.memory_queue) -> ReplayCause.memory_queue,
+        (c === VectorReplayCause.store_pending) -> ReplayCause.store_pending,
+        (c === VectorReplayCause.tlb_miss) -> ReplayCause.vector_tlb_miss,
+        (c === VectorReplayCause.page_crossing) -> ReplayCause.page_crossing,
+        true.B -> ReplayCause.vector))
+    }.getOrElse(ReplayCause.vector)
+    val wb_replay_decided = wb_reg_valid && !wb_reg_replay &&
+      (io.dmem.s2_nack || replay_wb_csr || replay_wb_rocc || replay_wb_vec)
     val wb_replay_cause = PriorityMux(Seq(
       (io.dmem.s2_nack && io.dmem.perf.acquire) -> ReplayCause.cache_miss,
       (io.dmem.s2_nack && io.dmem.s2_nack_cause_raw) -> ReplayCause.store_hazard,
       io.dmem.s2_nack -> ReplayCause.cache_nack,
       replay_wb_csr -> ReplayCause.csr_stall,
-      true.B -> ReplayCause.rocc_busy))
+      replay_wb_rocc -> ReplayCause.rocc_busy,
+      true.B -> wb_vector_replay_cause))
+    val wb_vector_checks = io.vector.map(v => wb_ctrl.vec && !v.wb.retire).getOrElse(false.B)
     when (wb_pc_valid) {
       EventTrace.test(at(Stage.Writeback).size === 1) {
         val i = in(Stage.Writeback)
-        when (csr.io.trace(0).exception) {
-          i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
-        } .elsewhen (replay_wb) {
-          when (wb_replay_decided) {
-            i.event("mark_replay") { "cause" := wb_replay_cause }
+        EventTrace.test(at(Stage.Check).size === 0) {
+          when (csr.io.trace(0).exception) {
+            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
+          } .elsewhen (replay_wb) {
+            when (wb_replay_decided) {
+              i.event("mark_replay") { "cause" := wb_replay_cause }
+            }
+            i.event("replay") { active.remove(i); i.destroy() }
+          } .elsewhen (wb_valid && wb_vector_checks) {
+            i.event("check") { i.stage := Stage.Check }
+          } .elsewhen (wb_valid) {
+            i.event("retire") { active.remove(i); i.destroy() }
           }
-          i.event("replay") { active.remove(i); i.destroy() }
-        } .elsewhen (wb_valid) {
-          i.event("retire") { active.remove(i); i.destroy() }
+        }.otherwise {
+          when (replay_wb) {
+            i.event("replay") { active.remove(i); i.destroy() }
+          }
+        }
+      }
+    }
+
+    // Check: the vector unit has Rocket retire the instruction or trap. It does the same for a vector instruction in
+    // Writeback, which the test leaves out, since Check is empty then.
+    io.vector.foreach { v =>
+      when (v.wb.retire || v.wb.xcpt) {
+        EventTrace.test(at(Stage.Check).size === 1) {
+          val i = in(Stage.Check)
+          when (v.wb.xcpt) {
+            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
+          } .otherwise {
+            i.event("retire") { active.remove(i); i.destroy() }
+          }
         }
       }
     }
 
     // Redirects: a misprediction in Memory squashes the instructions behind it; a trap, replay, xret, or pipeline
-    // flush in Writeback flushes them, naming the instruction in Writeback unless Rocket's carrier is there.
+    // flush in Writeback flushes them, naming the instruction in Writeback unless Rocket's carrier is there. An
+    // instruction in Check is older than all of them and stays.
     when (take_pc_mem && !take_pc_wb) {
       val branch = in(Stage.Memory)
       active.where(i => i.stage === Stage.Execute || i.stage === Stage.Decode).iter { i =>
@@ -1212,7 +1266,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }
     }
     when (take_pc_wb) {
-      val younger = active.where(_.stage =/= Stage.Writeback)
+      val younger = active.where(i => i.stage =/= Stage.Writeback && i.stage =/= Stage.Check)
       EventTrace.test(at(Stage.Writeback).size === 1) {
         val by = in(Stage.Writeback)
         younger.iter { i => i.event("flush") { "by" := by; active.remove(i); i.destroy() } }
