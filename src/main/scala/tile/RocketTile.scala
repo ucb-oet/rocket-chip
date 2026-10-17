@@ -21,7 +21,7 @@ import freechips.rocketchip.interrupts.IntIdentityNode
 import freechips.rocketchip.tilelink.{TLIdentityNode, TLBuffer}
 import freechips.rocketchip.rocket.{
   RocketCoreParams, ICacheParams, DCacheParams, BTBParams, HasHellaCache,
-  HasICacheFrontend, ScratchpadSlavePort, HasICacheFrontendModule, Rocket
+  HasICacheFrontend, ScratchpadSlavePort, HasICacheFrontendModule, Rocket, RocketTraceInstructions
 }
 import freechips.rocketchip.subsystem.HierarchicalElementCrossingParamsLike
 import freechips.rocketchip.prci.{ClockSinkParameters, RationalCrossing, ClockCrossingType}
@@ -139,7 +139,10 @@ class RocketTile private(
     }
   }
 
-  val vector_unit = rocketParams.core.vector.map(v => LazyModule(v.build(p)))
+  // EventTrace: the vector unit reaches Rocket's instructions, which the frontend declares, while it elaborates.
+  val vector_unit = rocketParams.core.vector.map(v => LazyModule(v.build(p.alterPartial {
+    case RocketTraceInstructions => () => frontend.module.instructions
+  })))
   vector_unit.foreach(vu => tlMasterXbar.node :=* vu.atlNode)
   vector_unit.foreach(vu => tlOtherMastersNode :=* vu.tlNode)
 

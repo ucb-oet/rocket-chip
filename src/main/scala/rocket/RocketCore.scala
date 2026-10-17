@@ -1087,7 +1087,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     import eventtrace.EventTrace.syntax._
     import RocketTrace.{FetchStage, Instruction, KillCause, ReplayCause, Stage, StallCause}
 
-    val active = EventTrace.collection(new Instruction(vaddrBitsExtended))
+    val active = tile.frontend.module.instructions
     val schema = new EventTrace.Schema[Instruction](new Instruction(vaddrBitsExtended)) {}
     def at(stage: Stage.Type) = active.where(_.stage === stage)
     def in(stage: Stage.Type) = at(stage).only

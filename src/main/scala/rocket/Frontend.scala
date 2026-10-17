@@ -97,6 +97,11 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
     */
   val packets = EventTrace.collection(new RocketTrace.Fetch(vaddrBitsExtended))
 
+  /** EventTrace, in configs that trace: the core's live instructions; see RocketTrace.Instruction. It is declared here
+    * because the frontend elaborates before the core and the vector unit, which both reach it through the tile.
+    */
+  val instructions = EventTrace.collection(new RocketTrace.Instruction(vaddrBitsExtended))
+
   val clock_en_reg = Reg(Bool())
   val clock_en = clock_en_reg || io.cpu.might_request
   io.cpu.clock_enabled := clock_en

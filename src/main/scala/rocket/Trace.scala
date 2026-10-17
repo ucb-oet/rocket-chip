@@ -3,7 +3,8 @@
 package freechips.rocketchip.rocket
 
 import chisel3._
-import eventtrace.EventTrace
+import org.chipsalliance.cde.config.Field
+import eventtrace.{Collection, EventTrace}
 
 /** What EventTrace records of Rocket's pipeline, in configs that trace: each instruction's pass from Decode until it
   * retires or is killed, and each fetch packet from the I-cache's answer until the instruction buffer has used it. A
@@ -107,3 +108,9 @@ object RocketTrace {
     val stage = mutable(FetchStage())
   }
 }
+
+/** EventTrace: Rocket's instructions, which the frontend declares and the tile hands to its vector unit, so that the
+  * vector unit's events can name the instruction each of its operations comes from. The vector unit calls it while it
+  * elaborates, after the frontend has.
+  */
+case object RocketTraceInstructions extends Field[() => Collection[RocketTrace.Instruction]]
