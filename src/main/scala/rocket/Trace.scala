@@ -3,114 +3,135 @@
 package freechips.rocketchip.rocket
 
 import chisel3._
+import chisel3.util.PriorityMux
 import org.chipsalliance.cde.config.Field
 import eventtrace.{Collection, EventTrace}
 
-/** What EventTrace records of Rocket's pipeline, in configs that trace: each instruction's pass from Decode until it
-  * retires or is killed, and each fetch packet from the I-cache's answer until the instruction buffer has used it. A
-  * replay kills an instruction and everything younger and refetches them, so each pass is its own object.
+/** What EventTrace records of Rocket, in configs that trace: each instruction's pass through the pipeline, and each
+  * fetch packet. A replay refetches, so each pass is its own object.
   */
 object RocketTrace {
 
-  /** The stage an instruction occupies. Decode is the instruction buffer's head, which no register holds. Check holds
-    * a vector instruction that passed Writeback without retiring, because the vector unit took it to check for traps
-    * element by element, as Saturn's iterative fault checker does; the vector unit then has Rocket retire it or trap.
-    */
+  /** Where an instruction is. */
   object Stage extends ChiselEnum {
-    val Decode, Execute, Memory, Writeback, Check = Value
+    val Decode    = Value // the instruction buffer's head, which no register holds
+    val Execute   = Value
+    val Memory    = Value
+    val Writeback = Value
+    val Check     = Value // past Writeback: the vector unit checks it for traps, then has Rocket retire it or trap
   }
 
-  /** Why Rocket replays an instruction, by the stage that decides it: in Execute, `cache_busy`, `divider_busy`,
-    * `checker_busy` (the vector unit, checking an older vector instruction for traps, cannot take a vector
-    * instruction), and `load_use` (an operand from a load that missed); in Memory, `writeback_port`, `fpu_nack`,
-    * `vector_memory` (a scalar access may not pass an older vector memory instruction: the one in Writeback, or one
-    * in the vector unit whose bytes it overlaps), and `checker_busy` (the vector unit is checking an older vector
-    * instruction for traps, or takes one now); in Writeback, `cache_miss` (the D-cache missed and asked for the line),
-    * `store_hazard` (the access touches bytes that a store the D-cache has accepted has not yet written to it),
-    * `cache_nack` (the D-cache refused it for any other reason, such as a dirty line to write back first),
-    * `csr_stall`, `rocc_busy`, and the vector unit's reasons, which `VectorReplayCause` describes: `checker_busy`,
-    * `age_tags`, `dispatch_queue`, `memory_queue`, `store_pending`, `vector_tlb_miss`, `page_crossing`, and `vector`
-    * for another reason.
-    */
+  /** Why Rocket replays an instruction, by the stage that decides it. */
   object ReplayCause extends ChiselEnum {
-    val cache_busy, divider_busy, checker_busy, load_use, writeback_port, fpu_nack, vector_memory, cache_miss,
-      store_hazard, cache_nack, csr_stall, rocc_busy, age_tags, dispatch_queue, memory_queue, store_pending,
-      vector_tlb_miss, page_crossing, vector = Value
+    // Execute
+    val cache_busy      = Value // a memory operation finds the D-cache not ready
+    val divider_busy    = Value
+    val checker_busy    = Value // the vector unit is checking an older instruction for traps; also Memory, Writeback
+    val load_use        = Value // an operand comes from a load that missed
+    // Memory
+    val writeback_port  = Value // the D-cache needs the writeback port
+    val fpu_nack        = Value
+    val vector_memory   = Value // a scalar access may not pass an older vector memory instruction
+    // Writeback
+    val cache_miss      = Value // the D-cache missed and asked for the line
+    val store_hazard    = Value // the access touches bytes that an accepted store has not yet written
+    val cache_nack      = Value // the D-cache refused it for another reason, such as a dirty line to write back
+    val csr_stall       = Value
+    val rocc_busy       = Value
+    // Writeback, the vector unit's reasons
+    val age_tags        = Value // no free age tag
+    val dispatch_queue  = Value // its dispatch queue is full
+    val memory_queue    = Value // its load or store instruction queue is full
+    val store_pending   = Value // a vector memory instruction waits for the D-cache to write the scalar stores
+    val vector_tlb_miss = Value
+    val page_crossing   = Value // the access continues into the next page, which the replay checks
+    val vector          = Value // another reason
   }
 
-  /** Why the instruction in Decode waits as its stall begins: the first term of `ctrl_stalld` that holds. A hazard
-    * names the instruction in Execute, Memory, or Writeback whose result it needs; `scoreboard` waits on a
-    * long-latency result whose instruction has retired; `vconfig` is a vector instruction waiting for a vset ahead
-    * of it to set vtype and vl in Writeback, and names the youngest such vset; `vector_busy` is a vector CSR access
-    * waiting for the vector unit to finish its work.
-    */
+  /** The vector unit's reason for a replay, as a `ReplayCause`. */
+  def replayCause(c: VectorReplayCause.Type): ReplayCause.Type = PriorityMux(Seq(
+    (c === VectorReplayCause.checker_busy)   -> ReplayCause.checker_busy,
+    (c === VectorReplayCause.age_tags)       -> ReplayCause.age_tags,
+    (c === VectorReplayCause.dispatch_queue) -> ReplayCause.dispatch_queue,
+    (c === VectorReplayCause.memory_queue)   -> ReplayCause.memory_queue,
+    (c === VectorReplayCause.store_pending)  -> ReplayCause.store_pending,
+    (c === VectorReplayCause.tlb_miss)       -> ReplayCause.vector_tlb_miss,
+    (c === VectorReplayCause.page_crossing)  -> ReplayCause.page_crossing,
+    true.B                                   -> ReplayCause.vector))
+
+  /** Why the instruction in Decode stalls: the first term of `ctrl_stalld` that holds as the stall begins. */
   object StallCause extends ChiselEnum {
-    val execute_hazard, memory_hazard, writeback_hazard, scoreboard, vconfig, fpu, vector_busy, cache_busy,
-      divider_busy, fence, other = Value
+    val execute_hazard   = Value // needs the result of the instruction in Execute, the blocker
+    val memory_hazard    = Value // in Memory
+    val writeback_hazard = Value // in Writeback
+    val scoreboard       = Value // waits for a long-latency result whose instruction has retired
+    val vconfig          = Value // a vector instruction waits for a vset ahead of it, the blocker
+    val fpu              = Value
+    val vector_busy      = Value // a vector CSR access waits for the vector unit
+    val cache_busy       = Value
+    val divider_busy     = Value
+    val fence            = Value
+    val other            = Value // single step, clock gating, or a CSR stall such as WFI
   }
 
-  /** One pass of a dynamic instruction through the pipeline. `bits` are as the commit log prints them, with a
-    * compressed instruction in the low half. `fetch` is the packet holding its last half, whose arrival let it decode:
-    * its only packet, or the second of two.
-    */
+  /** One pass of an instruction through the pipeline. */
   class Instruction(pcBits: Int) extends EventTrace.ObjectType("instruction") {
     val pc    = const(UInt(pcBits.W))
-    val bits  = const(UInt(32.W))
-    val fetch = const(Id(new Fetch(pcBits)))
+    val bits  = const(UInt(32.W))             // as the commit log prints them; a compressed one in the low half
+    val fetch = const(Id(new Fetch(pcBits)))  // the packet holding its last half
     val stage = mutable(Stage())
   }
 
-  /** Where a fetch packet is. S1 is the cycle its request is looked up in, in which it is created, so no event sets
-    * it; a view draws that cycle in it. S2 has the I-cache's answer; a packet S2 could not enqueue is in Miss while
-    * Rocket asks for it again; Queue is the fetch queue; Buffer is the instruction buffer holding a half the packet
-    * left over, a compressed instruction or the first half of one that ends in the next packet.
-    */
+  /** Where a fetch packet is. */
   object FetchStage extends ChiselEnum {
-    val S1, S2, Miss, Queue, Buffer = Value
+    val S1     = Value // looked up; the cycle it is created in, which no event sets
+    val S2     = Value // has the I-cache's answer
+    val Miss   = Value // S2 could not enqueue it, and Rocket asks for it again
+    val Queue  = Value // in the fetch queue
+    val Buffer = Value // in the instruction buffer, which holds a half of it
   }
 
-  /** Why S2 could not enqueue a packet: the fetch queue was full, the TLB missed, the I-cache missed and asked for the
-    * packet's line (`cache_miss`), or else the I-cache did not answer without asking for it (`cache_busy`), as when it
-    * is already refilling another line.
-    */
+  /** Why S2 could not enqueue a packet. */
   object MissCause extends ChiselEnum {
-    val cache_miss, cache_busy, tlb, queue_full = Value
+    val cache_miss = Value // the I-cache missed and asked for the line
+    val cache_busy = Value // the I-cache did not answer, without asking, as while it refills another line
+    val tlb        = Value
+    val queue_full = Value
   }
 
-  /** Why S2 hands on a packet marked for replay, which holds no instructions: the core carries the mark to Writeback,
-    * which fetches the packet's PC again, not speculatively. `speculative_miss`: the I-cache missed on a speculative
-    * fetch it may not refill for, as Rocket's chicken bit `disableSpeculativeICacheRefill` forbids by default or an
-    * uncacheable address does; `speculative_tlb_miss`: the TLB missed on a speculative fetch without recent progress;
-    * `cache_error`: the I-cache found a parity or ECC error; `btb_mid_instruction`: the BTB predicted a taken branch in
-    * the middle of an instruction.
-    */
+  /** Why S2 hands on a packet marked for replay, which Writeback fetches again. */
   object FetchReplayCause extends ChiselEnum {
-    val speculative_miss, speculative_tlb_miss, cache_error, btb_mid_instruction = Value
+    val speculative_miss     = Value // the I-cache missed on a speculative fetch it may not refill for
+    val speculative_tlb_miss = Value
+    val cache_error          = Value // a parity or ECC error
+    val btb_mid_instruction  = Value // the BTB predicted a taken branch in the middle of an instruction
   }
 
-  /** Why the core redirected fetch, killing every packet in flight. From Writeback, in Rocket's order: `interrupt`,
-    * `trap` (an exception, including an ecall or ebreak the CSR file raises), `eret`, `replay` (an instruction Rocket
-    * replays, or a packet the frontend marked for replay), and `flush` (an instruction that flushes the pipeline, such
-    * as a CSR write or fence.i). From Memory: `sfence`; `mispredict`, where the next instruction behind is not at the
-    * PC this one goes to; and `unconfirmed`, where neither Execute nor the instruction buffer holds a next instruction
-    * to check, so Rocket redirects without knowing fetch to be wrong.
-    */
+  /** Why the core redirected fetch, killing every packet in flight. */
   object KillCause extends ChiselEnum {
-    val interrupt, trap, eret, replay, flush, sfence, mispredict, unconfirmed = Value
+    // From Writeback, in Rocket's order
+    val interrupt   = Value
+    val trap        = Value // an exception, including an ecall or ebreak
+    val eret        = Value
+    val replay      = Value // an instruction's replay, or a packet marked for replay
+    val flush       = Value // an instruction that flushes the pipeline, such as a CSR write or fence.i
+    // From Memory
+    val sfence      = Value
+    val mispredict  = Value // the next instruction is not at the PC this one goes to
+    val unconfirmed = Value // no next instruction to check, so Rocket redirects without knowing fetch was wrong
   }
 
-  /** One fetch packet, the aligned bytes one I-cache access returns, from the I-cache's answer in S2 until the
-    * instruction buffer has used it or a redirect kills it. `pc` is the address requested, which ends in 2 after a
-    * jump into the packet's second half. A request killed in S1 returned nothing and is not traced.
+  /** One fetch packet, the aligned bytes of one I-cache access, from S2 until the instruction buffer uses it or a
+    * redirect kills it.
     */
   class Fetch(pcBits: Int) extends EventTrace.ObjectType("fetch") {
-    val pc    = const(UInt(pcBits.W))
+    val pc    = const(UInt(pcBits.W))  // the address requested; ends in 2 after a jump into the second half
     val stage = mutable(FetchStage())
   }
 }
 
-/** EventTrace: Rocket's instructions, which the frontend declares and the tile hands to its vector unit, so that the
-  * vector unit's events can name the instruction each of its operations comes from. The vector unit calls it while it
-  * elaborates, after the frontend has.
-  */
-case object RocketTraceInstructions extends Field[() => Collection[RocketTrace.Instruction]]
+/** EventTrace: Rocket's instructions, which the tile binds for the vector unit. */
+case object RocketTraceInstructions extends Field[Option[Collection[RocketTrace.Instruction]]](None)
+
+/** EventTrace: the frontend's fetch packets, which the tile binds for the core's instruction buffer. */
+case object RocketTracePackets extends Field[Option[Collection[RocketTrace.Fetch]]](None)

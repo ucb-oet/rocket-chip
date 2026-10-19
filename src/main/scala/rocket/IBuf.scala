@@ -8,8 +8,6 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 
-import eventtrace.EventTrace
-
 class Instruction(implicit val p: Parameters) extends ParameterizedBundle with HasCoreParameters {
   val xcpt0 = new FrontendExceptions // exceptions on first half of instruction
   val xcpt1 = new FrontendExceptions // exceptions on second half of instruction
@@ -20,8 +18,7 @@ class Instruction(implicit val p: Parameters) extends ParameterizedBundle with H
   require(coreInstBits == (if (usingCompressed) 16 else 32))
 }
 
-/** @param packets the frontend's fetch packets, which EventTrace follows into the buffer in configs that trace */
-class IBuf(packets: Option[EventTrace.Collection[RocketTrace.Fetch]] = None)(implicit p: Parameters) extends CoreModule {
+class IBuf(implicit p: Parameters) extends CoreModule {
   val io = IO(new Bundle {
     val imem = Flipped(Decoupled(new FrontendResp))
     val kill = Input(Bool())
@@ -81,23 +78,25 @@ class IBuf(packets: Option[EventTrace.Collection[RocketTrace.Fetch]] = None)(imp
   val ic_replay = buf_replay | Mux(io.imem.bits.replay, valid & ~bufMask, 0.U)
   assert(!io.imem.valid || !io.imem.bits.btb.taken || io.imem.bits.btb.bridx >= pcWordBits)
 
-  // EventTrace, in configs that trace; see RocketTrace.Fetch. The buffer takes the packet at the queue's head, which
-  // is still in S2 or Miss when the queue passes it straight through, and keeps it in Buffer while a half of it is
-  // left over. A packet is used up when its last half leaves.
-  packets.foreach { packets =>
-    import RocketTrace.FetchStage
-    when (io.imem.fire && !io.kill) {
-      val head = packets.where(_.stage =/= FetchStage.Buffer).head
-      when (nICReady < nIC) {
-        head.event("take") { head.stage := FetchStage.Buffer }
-      } .otherwise {
-        head.event("use") { packets.remove(head); head.destroy() }
+  // EventTrace: see RocketTrace.Fetch. The buffer takes the packet at the queue's head, still in S2 or Miss if the
+  // queue passed it straight through, and holds it in Buffer while a half of it is left. It is used up when its last
+  // half leaves.
+  p(RocketTracePackets) match {
+    case Some(packets) =>
+      import RocketTrace.FetchStage
+      when (io.imem.fire && !io.kill) {
+        val head = packets.where(_.stage =/= FetchStage.Buffer).head
+        when (nICReady < nIC) {
+          head.event("take") { head.stage := FetchStage.Buffer }
+        } .otherwise {
+          head.event("use") { packets.remove(head); head.destroy() }
+        }
       }
-    }
-    when (io.inst(0).ready && nBufValid =/= 0.U && nReady >= nBufValid && !io.kill) {
-      val held = packets.where(_.stage === FetchStage.Buffer).only
-      held.event("use") { packets.remove(held); held.destroy() }
-    }
+      when (io.inst(0).ready && nBufValid =/= 0.U && nReady >= nBufValid && !io.kill) {
+        val held = packets.where(_.stage === FetchStage.Buffer).only
+        held.event("use") { packets.remove(held); held.destroy() }
+      }
+    case None =>
   }
 
   io.btb_resp := io.imem.bits.btb

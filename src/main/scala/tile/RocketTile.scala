@@ -21,7 +21,8 @@ import freechips.rocketchip.interrupts.IntIdentityNode
 import freechips.rocketchip.tilelink.{TLIdentityNode, TLBuffer}
 import freechips.rocketchip.rocket.{
   RocketCoreParams, ICacheParams, DCacheParams, BTBParams, HasHellaCache,
-  HasICacheFrontend, ScratchpadSlavePort, HasICacheFrontendModule, Rocket, RocketTraceInstructions
+  HasICacheFrontend, ScratchpadSlavePort, HasICacheFrontendModule, Rocket, RocketTraceInstructions,
+  RocketTracePackets
 }
 import freechips.rocketchip.subsystem.HierarchicalElementCrossingParamsLike
 import freechips.rocketchip.prci.{ClockSinkParameters, RationalCrossing, ClockCrossingType}
@@ -139,9 +140,10 @@ class RocketTile private(
     }
   }
 
-  // EventTrace: the vector unit reaches Rocket's instructions, which the frontend declares, while it elaborates.
+  // EventTrace: the vector unit reaches Rocket's instructions, which the frontend declares. The key is read when the
+  // vector unit's module elaborates, after the frontend's.
   val vector_unit = rocketParams.core.vector.map(v => LazyModule(v.build(p.alterPartial {
-    case RocketTraceInstructions => () => frontend.module.instructions
+    case RocketTraceInstructions => Some(frontend.module.instructions)
   })))
   vector_unit.foreach(vu => tlMasterXbar.node :=* vu.atlNode)
   vector_unit.foreach(vu => tlOtherMastersNode :=* vu.tlNode)
@@ -170,7 +172,10 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasFpuOpt
     with HasLazyRoCCModule
     with HasICacheFrontendModule {
-  val core = Module(new Rocket(outer)(outer.p))
+  // EventTrace: the core's instruction buffer reaches the frontend's fetch packets.
+  val core = Module(new Rocket(outer)(outer.p.alterPartial {
+    case RocketTracePackets => Some(outer.frontend.module.packets)
+  }))
   outer.vector_unit.foreach { v =>
     core.io.vector.get <> v.module.io.core
     v.module.io.tlb <> outer.dcache.module.io.tlb_port

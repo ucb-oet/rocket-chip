@@ -20,15 +20,16 @@ case class RocketCoreVectorParams(
   vExts: Seq[String]
 )
 
-/** Why the vector unit asks Rocket to replay the vector instruction in Writeback, which Rocket's trace records. The
-  * vector unit is checking an older vector instruction for traps (`checker_busy`); its backend has no free age tag,
-  * no room in its dispatch queue, or no room in its load or store instruction queue (`age_tags`, `dispatch_queue`,
-  * `memory_queue`); a vector memory instruction waits for the D-cache to write the scalar stores it holds
-  * (`store_pending`); the TLB missed (`tlb_miss`); the access continues into the next page, which the replay checks
-  * after the part in this page has issued (`page_crossing`); or another reason (`other`).
-  */
+/** Why the vector unit asks Rocket to replay the vector instruction in Writeback, which Rocket's trace records. */
 object VectorReplayCause extends ChiselEnum {
-  val checker_busy, age_tags, dispatch_queue, memory_queue, store_pending, tlb_miss, page_crossing, other = Value
+  val checker_busy   = Value // the vector unit is checking an older vector instruction for traps
+  val age_tags       = Value // its backend has no free age tag
+  val dispatch_queue = Value // its dispatch queue is full
+  val memory_queue   = Value // its load or store instruction queue is full
+  val store_pending  = Value // a vector memory instruction waits for the D-cache to write the scalar stores
+  val tlb_miss       = Value
+  val page_crossing  = Value // the access continues into the next page, which the replay checks
+  val other          = Value
 }
 
 class VectorCoreIO(implicit p: Parameters) extends CoreBundle()(p) {

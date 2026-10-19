@@ -315,9 +315,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val take_pc = take_pc_mem_wb
 
   // decode stage
-  // EventTrace, in configs that trace: the frontend's fetch packets, which the buffer takes; see RocketTrace.Fetch.
-  val packets = tile.frontend.module.packets
-  val ibuf = Module(new IBuf(Some(packets)))
+  val ibuf = Module(new IBuf)
   val id_expanded_inst = ibuf.io.inst.map(_.bits.inst)
   val id_raw_inst = ibuf.io.inst.map(_.bits.raw)
   val id_inst = id_expanded_inst.map(_.bits)
@@ -1078,31 +1076,26 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     io.traceStall
   ctrl_killd := !ibuf.io.inst(0).valid || ibuf.io.inst(0).bits.replay || take_pc_mem_wb || ctrl_stalld || csr.io.interrupt
 
-  // EventTrace, in configs that trace: each instruction's pass through the pipeline, from the cycle it reaches the
-  // instruction buffer's head until it retires or is killed; see RocketTrace. Each stage holds at most one
-  // instruction, so a stage finds it. Fetch replay placeholders, and the carrier of an interrupt taken in Decode, are
-  // not instructions and are not traced. In Memory and Writeback, such a carrier has the bits of an instruction
-  // carrying a replay or an exception down the pipe, so a test on the stage's instructions tells them apart.
+  // EventTrace: each instruction from the instruction buffer's head until it retires or is killed; see RocketTrace.
+  // Each stage holds at most one instruction. Fetch replay placeholders, and the carrier of an interrupt taken in
+  // Decode, are not instructions; in Memory and Writeback, a test on the stage's instructions tells them apart.
   {
     import eventtrace.EventTrace.syntax._
     import RocketTrace.{FetchStage, Instruction, KillCause, ReplayCause, Stage, StallCause}
 
     val active = tile.frontend.module.instructions
-    val schema = new EventTrace.Schema[Instruction](new Instruction(vaddrBitsExtended)) {}
-    def at(stage: Stage.Type) = active.where(_.stage === stage)
-    def in(stage: Stage.Type) = at(stage).only
+    val packets = tile.frontend.module.packets
+    def instructionsIn(stage: Stage.Type) = active.where(_.stage === stage)
+    def instructionIn(stage: Stage.Type) = instructionsIn(stage).only
 
-    // Whether the head already has its object: it does while it stalls after its first cycle. Execute holds a traced
-    // instruction exactly when ex_reg_valid.
+    // Whether the head already has its object, as while it stalls after its first cycle.
     val id_head = ibuf.io.inst(0).valid && !ibuf.io.inst(0).bits.replay
     val id_traced = RegInit(false.B)
     val id_new = id_head && !id_traced && !take_pc && !csr.io.interrupt
     id_traced := id_head && (id_traced || !csr.io.interrupt) && ctrl_stalld && !take_pc
 
-    // Decode. The head is in Decode in the cycle it arrives, so its create event sets the stage it has after the
-    // edge: Execute if it issues at once, Decode if it stalls. A head stalls from its first cycle or not at all, so
-    // the create event carries the stall's cause, the first term of ctrl_stalld that holds, and the instruction it
-    // waits on: for a hazard, in the stage whose hazard holds first; for vconfig, the youngest vset ahead of it.
+    // Decode. A head issues in its first cycle or stalls from it, so its create event sets the stage it has after
+    // the edge and carries the stall's cause and blocker.
     val id_stall_cause = PriorityMux(Seq(
       id_ex_hazard -> StallCause.execute_hazard,
       id_mem_hazard -> StallCause.memory_hazard,
@@ -1121,45 +1114,50 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       true.B -> StallCause.other)) // csr_stall, id_reg_pause, traceStall
     val id_hazard = id_ex_hazard || id_mem_hazard || id_wb_hazard
     val id_blocker_stage = Mux(id_ex_hazard, Stage.Execute, Mux(id_mem_hazard, Stage.Memory, Stage.Writeback))
+    // A vector instruction waits for the youngest vset ahead of it.
     val id_vconfig_stall = !id_hazard && !id_sboard_hazard && id_vconfig_hazard
     val id_vconfig_stage = Mux(ex_reg_valid && ex_reg_set_vconfig, Stage.Execute,
       Mux(mem_reg_valid && mem_reg_set_vconfig, Stage.Memory, Stage.Writeback))
     val id_bits = Mux(ibuf.io.inst(0).bits.rvc, id_raw_inst(0)(15, 0), id_raw_inst(0))
-    // The packet holding the head's last half. A packet in Buffer is the oldest, and a compressed instruction that
-    // starts in its held half lies wholly in it; any other instruction ends in the packet at the queue's head.
+    // The packet holding the head's last half: the held one for a compressed instruction starting in it, else the
+    // queue's head.
     val id_fetch = packets.where(p => p.stage =/= FetchStage.Buffer || ibuf.io.inst(0).bits.rvc).head
-    def decode(stage: Stage.Type, stalled: Boolean, blocker: Option[Instruction]) =
-      schema.create(event = "decode") { i =>
+    def decode(stage: Stage.Type)(captures: => Unit) =
+      EventTrace.create(new Instruction(vaddrBitsExtended), event = "decode") { i =>
         i.pc := ibuf.io.pc
         i.bits := id_bits
         i.fetch := id_fetch
         i.stage := stage
-        if (stalled) "stall" := id_stall_cause else "stall" := Absent
-        blocker match {
-          case Some(b) => "blocker" := b
-          case None    => "blocker" := Absent
-        }
+        captures
         active.add(i)
       }
+    def decodeIssuing() = decode(Stage.Execute) { "stall" := Absent; "blocker" := Absent }
+    def decodeStalled(blocker: Option[Instruction]) = decode(Stage.Decode) {
+      "stall" := id_stall_cause
+      blocker match {
+        case Some(b) => "blocker" := b
+        case None    => "blocker" := Absent
+      }
+    }
     when (id_new && !ctrl_killd) {
-      decode(Stage.Execute, stalled = false, None)
+      decodeIssuing()
     }
     when (id_new && ctrl_stalld) {
       when (id_hazard) {
-        decode(Stage.Decode, stalled = true, Some(in(id_blocker_stage)))
+        decodeStalled(Some(instructionIn(id_blocker_stage)))
       } .elsewhen (id_vconfig_stall) {
-        decode(Stage.Decode, stalled = true, Some(in(id_vconfig_stage)))
+        decodeStalled(Some(instructionIn(id_vconfig_stage)))
       } .otherwise {
-        decode(Stage.Decode, stalled = true, None)
+        decodeStalled(None)
       }
     }
     when (id_traced && !ctrl_killd) {
-      val i = in(Stage.Decode)
+      val i = instructionIn(Stage.Decode)
       i.event("issue") { i.stage := Stage.Execute }
     }
 
-    // Execute and Memory: an instruction moves on unless an older one redirects fetch, including one that Rocket
-    // has decided to replay, which `mark_replay` marks.
+    // Execute and Memory: an instruction moves on unless an older one redirects fetch. `mark_replay` marks where
+    // Rocket decides a replay.
     val ex_cache_busy = ex_ctrl.mem && !io.dmem.req.ready
     val ex_divider_busy = ex_ctrl.div && !div.io.req.ready
     val ex_checker_busy = ex_ctrl.vec && !io.vector.map(_.ex.ready).getOrElse(true.B)
@@ -1169,7 +1167,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ex_checker_busy -> ReplayCause.checker_busy,
       true.B -> ReplayCause.load_use))
     when (ex_reg_valid && !take_pc_mem_wb) {
-      val i = in(Stage.Execute)
+      val i = instructionIn(Stage.Execute)
       when (ex_cache_busy || ex_divider_busy || ex_checker_busy || replay_ex_load_use) {
         i.event("mark_replay") { "cause" := ex_replay_cause }
       }
@@ -1181,8 +1179,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       vec_kill_mem -> ReplayCause.vector_memory,
       true.B -> ReplayCause.checker_busy))
     when (mem_pc_valid && !take_pc_wb) {
-      EventTrace.test(at(Stage.Memory).size === 1) {
-        val i = in(Stage.Memory)
+      EventTrace.test(instructionsIn(Stage.Memory).size === 1) {
+        val i = instructionIn(Stage.Memory)
         when (dcache_kill_mem || fpu_kill_mem || vec_kill_mem || vec_kill_all) {
           i.event("mark_replay") { "cause" := mem_replay_cause }
         }
@@ -1190,23 +1188,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }
     }
 
-    // Writeback: an instruction traps, replays, or retires, in Rocket's order. The CSR file decides the trap, since
-    // an ecall or ebreak that Rocket's pipeline counts as valid raises an exception there. A vector instruction that
-    // the vector unit lets pass without retiring goes to Check. While one is there, the vector unit has Rocket kill
-    // every instruction in Memory, so the one in Writeback replays, and a trap is the checked instruction's. That kill
-    // alone leaves an instruction valid, and Memory has already marked why it replays.
-    val wb_vector_replay_cause = io.vector.map { v =>
-      val c = v.wb.replay_cause
-      PriorityMux(Seq(
-        (c === VectorReplayCause.checker_busy) -> ReplayCause.checker_busy,
-        (c === VectorReplayCause.age_tags) -> ReplayCause.age_tags,
-        (c === VectorReplayCause.dispatch_queue) -> ReplayCause.dispatch_queue,
-        (c === VectorReplayCause.memory_queue) -> ReplayCause.memory_queue,
-        (c === VectorReplayCause.store_pending) -> ReplayCause.store_pending,
-        (c === VectorReplayCause.tlb_miss) -> ReplayCause.vector_tlb_miss,
-        (c === VectorReplayCause.page_crossing) -> ReplayCause.page_crossing,
-        true.B -> ReplayCause.vector))
-    }.getOrElse(ReplayCause.vector)
+    // Writeback: an instruction traps, replays, or retires, in Rocket's order; the CSR file decides the trap. A vector
+    // instruction the vector unit takes to check goes to Check. While Check holds one, Rocket kills the instruction in
+    // Memory, so it replays here (Memory marked why), and a trap is the checked instruction's.
     val wb_replay_decided = wb_reg_valid && !wb_reg_replay &&
       (io.dmem.s2_nack || replay_wb_csr || replay_wb_rocc || replay_wb_vec)
     val wb_replay_cause = PriorityMux(Seq(
@@ -1215,12 +1199,12 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       io.dmem.s2_nack -> ReplayCause.cache_nack,
       replay_wb_csr -> ReplayCause.csr_stall,
       replay_wb_rocc -> ReplayCause.rocc_busy,
-      true.B -> wb_vector_replay_cause))
+      true.B -> io.vector.map(v => RocketTrace.replayCause(v.wb.replay_cause)).getOrElse(ReplayCause.vector)))
     val wb_vector_checks = io.vector.map(v => wb_ctrl.vec && !v.wb.retire).getOrElse(false.B)
     when (wb_pc_valid) {
-      EventTrace.test(at(Stage.Writeback).size === 1) {
-        val i = in(Stage.Writeback)
-        EventTrace.test(at(Stage.Check).size === 0) {
+      EventTrace.test(instructionsIn(Stage.Writeback).size === 1) {
+        val i = instructionIn(Stage.Writeback)
+        EventTrace.test(instructionsIn(Stage.Check).size === 0) {
           when (csr.io.trace(0).exception) {
             i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
           } .elsewhen (replay_wb) {
@@ -1241,12 +1225,12 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       }
     }
 
-    // Check: the vector unit has Rocket retire the instruction or trap. It does the same for a vector instruction in
-    // Writeback, which the test leaves out, since Check is empty then.
+    // Check: the vector unit has Rocket retire the instruction or trap. It signals the same for a vector instruction
+    // in Writeback, when Check is empty.
     io.vector.foreach { v =>
       when (v.wb.retire || v.wb.xcpt) {
-        EventTrace.test(at(Stage.Check).size === 1) {
-          val i = in(Stage.Check)
+        EventTrace.test(instructionsIn(Stage.Check).size === 1) {
+          val i = instructionIn(Stage.Check)
           when (v.wb.xcpt) {
             i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
           } .otherwise {
@@ -1260,23 +1244,23 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // flush in Writeback flushes them, naming the instruction in Writeback unless Rocket's carrier is there. An
     // instruction in Check is older than all of them and stays.
     when (take_pc_mem && !take_pc_wb) {
-      val branch = in(Stage.Memory)
+      val branch = instructionIn(Stage.Memory)
       active.where(i => i.stage === Stage.Execute || i.stage === Stage.Decode).iter { i =>
         i.event("squash") { "by" := branch; active.remove(i); i.destroy() }
       }
     }
     when (take_pc_wb) {
       val younger = active.where(i => i.stage =/= Stage.Writeback && i.stage =/= Stage.Check)
-      EventTrace.test(at(Stage.Writeback).size === 1) {
-        val by = in(Stage.Writeback)
+      EventTrace.test(instructionsIn(Stage.Writeback).size === 1) {
+        val by = instructionIn(Stage.Writeback)
         younger.iter { i => i.event("flush") { "by" := by; active.remove(i); i.destroy() } }
       }.otherwise {
         younger.iter { i => i.event("flush") { "by" := Absent; active.remove(i); i.destroy() } }
       }
     }
 
-    // A redirect kills every fetch packet, from S2 to the instruction buffer. Writeback's redirects come first, as
-    // io.imem.req.bits.pc chooses; Memory's are the terms of mem_wrong_npc.
+    // A redirect kills every fetch packet. Writeback's redirects come first, as io.imem.req.bits.pc chooses; Memory's
+    // are the terms of mem_wrong_npc.
     val kill_cause = PriorityMux(Seq(
       (csr.io.trace(0).exception && csr.io.trace(0).interrupt) -> KillCause.interrupt,
       csr.io.trace(0).exception -> KillCause.trap,

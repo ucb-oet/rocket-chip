@@ -92,13 +92,11 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
 
   val fq = withReset(reset.asBool || io.cpu.req.valid) { Module(new ShiftQueue(new FrontendResp, 5, flow = true)) }
 
-  /** EventTrace, in configs that trace: every live fetch packet, oldest first; see RocketTrace.Fetch. The instruction
-    * buffer and the core reach it through the tile.
-    */
+  /** EventTrace: the live fetch packets, oldest first, which the instruction buffer and the core reach by the tile. */
   val packets = EventTrace.collection(new RocketTrace.Fetch(vaddrBitsExtended))
 
-  /** EventTrace, in configs that trace: the core's live instructions; see RocketTrace.Instruction. It is declared here
-    * because the frontend elaborates before the core and the vector unit, which both reach it through the tile.
+  /** EventTrace: the core's live instructions, declared here since the frontend elaborates before the core and the
+    * vector unit.
     */
   val instructions = EventTrace.collection(new RocketTrace.Instruction(vaddrBitsExtended))
 
@@ -384,25 +382,28 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   io.cpu.perf.tlbMiss := io.ptw.req.fire
   io.errors := icache.io.errors
 
-  // EventTrace, in configs that trace: each packet from the I-cache's answer in S2 until the instruction buffer takes
-  // it; see RocketTrace.Fetch. A packet is created as S1 moves it to S2, so a request killed in S1 is not traced. A
-  // packet S2 cannot enqueue stays one object, in Miss, while s0 asks for it again, and its retries record nothing.
-  // A packet the queue passes straight through to the buffer is never in Queue.
+  // EventTrace: each packet from the cycle S1 moves it to S2 until the instruction buffer takes it; see
+  // RocketTrace.Fetch. A packet S2 cannot enqueue stays one object, in Miss, while s0 asks for it again. One the queue
+  // passes straight through to the buffer is never in Queue.
   {
     import eventtrace.EventTrace.syntax._
     import RocketTrace.{Fetch, FetchReplayCause, FetchStage, MissCause}
 
-    val schema = new EventTrace.Schema[Fetch](new Fetch(vaddrBitsExtended)) {}
-    def at(stage: FetchStage.Type) = packets.where(_.stage === stage)
+    def packetsIn(stage: FetchStage.Type) = packets.where(_.stage === stage)
+    def packetInS2 = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only
     // S1 holds the address s0 asked for again because S2 failed. It is the packet in Miss, unless S2 held no request,
     // as when s0 left it empty for want of queue space.
     val s1_retry = RegNext(s0_valid && !io.cpu.req.valid && s2_replay, false.B)
     val s2_through = !fq.io.mask(0) && fq.io.deq.ready
 
-    def lookup() = schema.create(event = "lookup") { f => f.pc := s1_pc; f.stage := FetchStage.S2; packets.add(f) }
+    def lookup() = EventTrace.create(new Fetch(vaddrBitsExtended), event = "lookup") { f =>
+      f.pc := s1_pc
+      f.stage := FetchStage.S2
+      packets.add(f)
+    }
     when (s1_valid && !s2_replay && !s2_redirect) {
       when (s1_retry) {
-        EventTrace.test(at(FetchStage.Miss).size === 0) { lookup() }
+        EventTrace.test(packetsIn(FetchStage.Miss).size === 0) { lookup() }
       } .otherwise {
         lookup()
       }
@@ -414,26 +415,25 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
         s2_tlb_resp.miss -> MissCause.tlb,
         icache.io.perf.acquire -> MissCause.cache_miss,
         true.B -> MissCause.cache_busy))
-      EventTrace.test(at(FetchStage.S2).size === 1) {
-        val f = at(FetchStage.S2).only
+      EventTrace.test(packetsIn(FetchStage.S2).size === 1) {
+        val f = packetsIn(FetchStage.S2).only
         f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause }
       }
     }
-    // S2 hands on a packet marked for replay, which the core will refetch from Writeback. The cause follows the terms
-    // of fq.io.enq.bits.replay; the BTB's is the one left. S2 hands on a packet after a TLB miss only for a speculative
-    // TLB refill, so the miss alone tells that term, without repeating an expression of Rocket's: firtool would merge
-    // the two and could rename Rocket's wire in configs that do not trace.
+    // S2 hands on a packet marked for replay, which Writeback refetches. The causes follow fq.io.enq.bits.replay's
+    // terms. A TLB miss alone tells the speculative refill's term: repeating Rocket's expression would let firtool
+    // merge the two and rename Rocket's wire in configs that do not trace.
     when (fq.io.enq.fire && fq.io.enq.bits.replay && !io.cpu.req.valid) {
       val cause = PriorityMux(Seq(
         (icache.io.resp.valid && icache.io.resp.bits.replay) -> FetchReplayCause.cache_error,
         s2_tlb_resp.miss -> FetchReplayCause.speculative_tlb_miss,
         (icache.io.s2_kill && !icache.io.resp.valid && !s2_xcpt) -> FetchReplayCause.speculative_miss,
         true.B -> FetchReplayCause.btb_mid_instruction))
-      val f = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only
+      val f = packetInS2
       f.event("mark_replay") { "cause" := cause }
     }
     when (fq.io.enq.fire && !s2_through && !io.cpu.req.valid) {
-      val f = packets.where(p => p.stage === FetchStage.S2 || p.stage === FetchStage.Miss).only
+      val f = packetInS2
       f.event("enqueue") { f.stage := FetchStage.Queue }
     }
   }
