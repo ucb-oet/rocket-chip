@@ -417,7 +417,7 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
         true.B -> MissCause.cache_busy))
       EventTrace.test(packetsIn(FetchStage.S2).size === 1) {
         val f = packetsIn(FetchStage.S2).only
-        f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause }
+        f.event("miss") { f.stage := FetchStage.Miss; "cause" := cause; f.blocked() }
       }
     }
     // S2 hands on a packet marked for replay, which Writeback refetches. The causes follow fq.io.enq.bits.replay's

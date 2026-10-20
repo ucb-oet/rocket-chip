@@ -89,12 +89,12 @@ class IBuf(implicit p: Parameters) extends CoreModule {
         when (nICReady < nIC) {
           head.event("take") { head.stage := FetchStage.Buffer }
         } .otherwise {
-          head.event("use") { packets.remove(head); head.destroy() }
+          head.event("use") { packets.remove(head); head.complete() }
         }
       }
       when (io.inst(0).ready && nBufValid =/= 0.U && nReady >= nBufValid && !io.kill) {
         val held = packets.where(_.stage === FetchStage.Buffer).only
-        held.event("use") { packets.remove(held); held.destroy() }
+        held.event("use") { packets.remove(held); held.complete() }
       }
     case None =>
   }

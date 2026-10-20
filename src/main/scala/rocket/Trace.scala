@@ -78,7 +78,7 @@ object RocketTrace {
   class Instruction(pcBits: Int) extends EventTrace.ObjectType("instruction") {
     val pc    = const(UInt(pcBits.W))
     val bits  = const(UInt(32.W))             // as the commit log prints them; a compressed one in the low half
-    val fetch = const(Id(new Fetch(pcBits)))  // the packet holding its last half
+    val fetch = parent(new Fetch(pcBits))     // the packet holding its last half
     val stage = mutable(Stage())
   }
 

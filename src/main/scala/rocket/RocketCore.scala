@@ -1122,21 +1122,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     // The packet holding the head's last half: the held one for a compressed instruction starting in it, else the
     // queue's head.
     val id_fetch = packets.where(p => p.stage =/= FetchStage.Buffer || ibuf.io.inst(0).bits.rvc).head
-    def decode(stage: Stage.Type)(captures: => Unit) =
+    def decode(stage: Stage.Type)(captures: Instruction => Unit) =
       EventTrace.create(new Instruction(vaddrBitsExtended), event = "decode") { i =>
         i.pc := ibuf.io.pc
         i.bits := id_bits
         i.fetch := id_fetch
         i.stage := stage
-        captures
+        captures(i)
         active.add(i)
       }
-    def decodeIssuing() = decode(Stage.Execute) { "stall" := Absent; "blocker" := Absent }
-    def decodeStalled(blocker: Option[Instruction]) = decode(Stage.Decode) {
+    def decodeIssuing() = decode(Stage.Execute) { _ => "stall" := Absent; "by" := Absent }
+    def decodeStalled(blocker: Option[Instruction]) = decode(Stage.Decode) { i =>
       "stall" := id_stall_cause
       blocker match {
-        case Some(b) => "blocker" := b
-        case None    => "blocker" := Absent
+        case Some(b) => i.blocked(by = b)
+        case None    => i.blocked(by = Absent)
       }
     }
     when (id_new && !ctrl_killd) {
@@ -1206,20 +1206,20 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
         val i = instructionIn(Stage.Writeback)
         EventTrace.test(instructionsIn(Stage.Check).size === 0) {
           when (csr.io.trace(0).exception) {
-            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
+            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.abort() }
           } .elsewhen (replay_wb) {
             when (wb_replay_decided) {
               i.event("mark_replay") { "cause" := wb_replay_cause }
             }
-            i.event("replay") { active.remove(i); i.destroy() }
+            i.event("replay") { active.remove(i); i.abort() }
           } .elsewhen (wb_valid && wb_vector_checks) {
             i.event("check") { i.stage := Stage.Check }
           } .elsewhen (wb_valid) {
-            i.event("retire") { active.remove(i); i.destroy() }
+            i.event("retire") { active.remove(i); i.complete() }
           }
         }.otherwise {
           when (replay_wb) {
-            i.event("replay") { active.remove(i); i.destroy() }
+            i.event("replay") { active.remove(i); i.abort() }
           }
         }
       }
@@ -1232,9 +1232,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
         EventTrace.test(instructionsIn(Stage.Check).size === 1) {
           val i = instructionIn(Stage.Check)
           when (v.wb.xcpt) {
-            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.destroy() }
+            i.event("trap") { "cause" := csr.io.trace(0).cause; active.remove(i); i.abort() }
           } .otherwise {
-            i.event("retire") { active.remove(i); i.destroy() }
+            i.event("retire") { active.remove(i); i.complete() }
           }
         }
       }
@@ -1246,16 +1246,16 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     when (take_pc_mem && !take_pc_wb) {
       val branch = instructionIn(Stage.Memory)
       active.where(i => i.stage === Stage.Execute || i.stage === Stage.Decode).iter { i =>
-        i.event("squash") { "by" := branch; active.remove(i); i.destroy() }
+        i.event("squash") { active.remove(i); i.abort(by = branch) }
       }
     }
     when (take_pc_wb) {
       val younger = active.where(i => i.stage =/= Stage.Writeback && i.stage =/= Stage.Check)
       EventTrace.test(instructionsIn(Stage.Writeback).size === 1) {
         val by = instructionIn(Stage.Writeback)
-        younger.iter { i => i.event("flush") { "by" := by; active.remove(i); i.destroy() } }
+        younger.iter { i => i.event("flush") { active.remove(i); i.abort(by = by) } }
       }.otherwise {
-        younger.iter { i => i.event("flush") { "by" := Absent; active.remove(i); i.destroy() } }
+        younger.iter { i => i.event("flush") { active.remove(i); i.abort(by = Absent) } }
       }
     }
 
@@ -1271,7 +1271,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       (!ex_pc_valid && !(ibuf.io.inst(0).valid || ibuf.io.imem.valid)) -> KillCause.unconfirmed,
       true.B -> KillCause.mispredict))
     when (take_pc) {
-      packets.iter { f => f.event("kill") { "cause" := kill_cause; packets.remove(f); f.destroy() } }
+      packets.iter { f => f.event("kill") { "cause" := kill_cause; packets.remove(f); f.abort() } }
     }
   }
 
